@@ -1,6 +1,7 @@
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -12,18 +13,14 @@ ARTIFACTS = ROOT / "artifacts"
 
 load_dotenv(ROOT / ".env")
 
-ALLOWED_SEVERITIES = {
-    "CRITICAL", "HIGH", "MEDIUM", "LOW"
-}
+ALLOWED_SEVERITIES = {"CRITICAL", "HIGH", "MEDIUM", "LOW"}
 
 
 def load_parsed_data(pr_number):
     input_file = ARTIFACTS / f"pr_{pr_number}_parsed.json"
 
     if not input_file.exists():
-        raise FileNotFoundError(
-            f"Parsed PR file not found: {input_file}"
-        )
+        raise FileNotFoundError(f"Parsed PR file not found: {input_file}")
 
     with open(input_file, "r", encoding="utf-8") as file:
         data = json.load(file)
@@ -47,45 +44,30 @@ def get_added_lines(parsed_data):
             line_number = line.get("line_number")
 
             if isinstance(line_number, int):
-                valid_lines[(filename, line_number)] = (
-                    line.get("code", "")
-                )
+                valid_lines[(filename, line_number)] = line.get("code", "")
 
     return valid_lines
 
 
-def is_bug_or_security_finding(finding):
-    issue_text = " ".join([
+def get_issue_text(finding):
+    return " ".join([
         str(finding.get("issue_type", "")),
         str(finding.get("title", "")),
         str(finding.get("explanation", ""))
     ]).lower()
 
-    # Exclude SQL injection findings.
+
+def is_bug_or_security_finding(finding):
+    issue_text = get_issue_text(finding)
+
     if "sql" in issue_text and any(
         word in issue_text
-        for word in [
-            "injection",
-            "concatenation",
-            "unsafe query",
-            "dynamic sql"
-        ]
+        for word in ["injection", "concatenation", "unsafe query", "dynamic sql"]
     ):
         return True
 
-    # Exclude division-by-zero findings.
-    division_words = [
-        "division",
-        "divide",
-        "dividing",
-        "denominator"
-    ]
-
-    zero_words = [
-        "zero",
-        "0",
-        "without zero check"
-    ]
+    division_words = ["division", "divide", "dividing", "denominator"]
+    zero_words = ["zero", "0", "without zero check"]
 
     if (
         any(word in issue_text for word in division_words)
@@ -93,19 +75,72 @@ def is_bug_or_security_finding(finding):
     ):
         return True
 
-    # Runtime error-handling issues belong to Bug Finder.
     if "missing error handling" in issue_text:
         return True
 
     return False
 
 
+def is_subjective_math_parameter_finding(finding, code):
+    issue_text = get_issue_text(finding)
+
+    naming_issue = (
+        "parameter" in issue_text
+        and any(word in issue_text for word in [
+            "name", "descriptive", "naming"
+        ])
+    )
+
+    if not naming_issue:
+        return False
+
+    match = re.match(
+        r"\s*def\s+([A-Za-z_]\w*)\s*\(([^)]*)\)",
+        code
+    )
+
+    if not match:
+        return False
+
+    function_name = match.group(1).lower()
+    parameter_text = match.group(2)
+
+    math_words = [
+        "add", "subtract", "minus", "divide",
+        "multiply", "sum", "product", "average",
+        "calculate", "power"
+    ]
+
+    is_math_function = any(
+        word in function_name for word in math_words
+    )
+
+    parameters = []
+
+    for parameter in parameter_text.split(","):
+        parameter = parameter.strip()
+
+        if not parameter:
+            continue
+
+        parameter = parameter.split("=")[0].split(":")[0].strip()
+        parameters.append(parameter)
+
+    conventional_names = {"a", "b", "x", "y"}
+
+    return (
+        is_math_function
+        and len(parameters) >= 2
+        and all(
+            re.fullmatch(r"[A-Za-z_]\w*", p)
+            and p.lower() in conventional_names
+            for p in parameters
+        )
+    )
+
+
 def is_false_temporary_variable_finding(finding, code):
-    issue_text = " ".join([
-        str(finding.get("issue_type", "")),
-        str(finding.get("title", "")),
-        str(finding.get("explanation", ""))
-    ]).lower()
+    issue_text = get_issue_text(finding)
 
     is_temporary_variable = (
         "temporary variable" in issue_text
@@ -114,19 +149,14 @@ def is_false_temporary_variable_finding(finding, code):
 
     code_lower = code.lower()
 
-    sql_keywords = [
-        "select ",
-        "insert ",
-        "update ",
-        "delete "
-    ]
+    sql_keywords = ["select ", "insert ", "update ", "delete "]
 
     is_dynamic_sql = (
         any(keyword in code_lower for keyword in sql_keywords)
         and (
             "+" in code
             or ".format(" in code_lower
-            or "f\"" in code_lower
+            or 'f"' in code_lower
             or "f'" in code_lower
         )
     )
@@ -135,11 +165,7 @@ def is_false_temporary_variable_finding(finding, code):
 
 
 def get_standard_severity(finding):
-    issue_text = " ".join([
-        str(finding.get("issue_type", "")),
-        str(finding.get("title", "")),
-        str(finding.get("explanation", ""))
-    ]).lower()
+    issue_text = get_issue_text(finding)
 
     temporary_variable_indicators = [
         "unnecessary temporary variable",
@@ -167,14 +193,13 @@ def review_style(parsed_data, valid_lines):
     client = Groq(api_key=api_key)
 
     prompt = f"""
-You are an experienced software engineer performing a
-code quality and maintainability review of a GitHub Pull Request.
+You are an experienced software engineer reviewing a GitHub Pull Request.
 
-Analyze changed code for meaningful style and quality problems.
+Analyze changed code for meaningful style and maintainability problems.
 
 Focus on:
 1. Unnecessary temporary variables.
-2. Poor variable and function naming.
+2. Poor naming that genuinely makes code difficult to understand.
 3. Repeated or redundant code.
 4. Poor readability and maintainability.
 5. Unnecessary complexity.
@@ -186,9 +211,11 @@ DO NOT REPORT:
 - Generic missing error handling.
 - Minor formatting issues.
 - Personal style preferences.
-- Issues better handled by the Bug Finder or Security Checker.
+- Issues better handled by Bug Finder or Security Checker.
 - A variable as unnecessary merely because it appears once.
-  First check whether it improves readability or serves a purpose.
+- Conventional single-letter parameters such as a, b, x and y
+  in simple mathematical functions such as divide_numbers.
+- Subjective naming suggestions that do not materially improve clarity.
 
 SEVERITY POLICY:
 - Unnecessary temporary variable: LOW.
@@ -197,12 +224,11 @@ SEVERITY POLICY:
 - Do not assign HIGH or CRITICAL to ordinary style issues.
 
 Rules:
-- Focus on meaningful improvements.
+- Focus on meaningful, evidence-based improvements.
 - Do not invent missing requirements.
 - Report only issues on added lines.
 - Use exact filenames and line numbers.
-- Explain why code quality should be improved.
-- Suggest a practical correction.
+- Suggest practical corrections.
 - Avoid duplicate findings.
 
 Return ONLY valid JSON in this format:
@@ -223,9 +249,7 @@ Return ONLY valid JSON in this format:
     ]
 }}
 
-Severity must be one of:
-CRITICAL, HIGH, MEDIUM, LOW.
-
+Severity must be one of: CRITICAL, HIGH, MEDIUM, LOW.
 Confidence must be between 0 and 1.
 
 If no meaningful style issues are found, return an empty findings array.
@@ -256,7 +280,6 @@ Changed code:
     )
 
     result = json.loads(response.choices[0].message.content)
-
     findings = result.get("findings", [])
 
     if not isinstance(findings, list):
@@ -273,26 +296,23 @@ Changed code:
             continue
 
         if (filename, line_number) not in valid_lines:
-            print(
-                f"Skipped invalid line reference: "
-                f"{filename}:{line_number}"
-            )
+            print(f"Skipped invalid line reference: {filename}:{line_number}")
             continue
 
-        # Exclude security and runtime bug findings.
         if is_bug_or_security_finding(finding):
-            print(
-                f"Skipped non-style finding: "
-                f"{filename}:{line_number}"
-            )
+            print(f"Skipped non-style finding: {filename}:{line_number}")
             continue
 
         source_code = valid_lines[(filename, line_number)]
 
-        # Exclude false temporary-variable findings on dynamic SQL lines.
-        if is_false_temporary_variable_finding(
-            finding, source_code
-        ):
+        if is_subjective_math_parameter_finding(finding, source_code):
+            print(
+                f"Skipped subjective mathematical parameter naming finding: "
+                f"{filename}:{line_number}"
+            )
+            continue
+
+        if is_false_temporary_variable_finding(finding, source_code):
             print(
                 f"Skipped false temporary-variable finding: "
                 f"{filename}:{line_number}"
@@ -303,20 +323,14 @@ Changed code:
             finding.get("issue_type", "Code Quality")
         ).strip()
 
-        key = (
-            filename,
-            line_number,
-            issue_type.lower()
-        )
+        key = (filename, line_number, issue_type.lower())
 
         if key in seen:
             continue
 
         seen.add(key)
 
-        severity = str(
-            finding.get("severity", "LOW")
-        ).upper()
+        severity = str(finding.get("severity", "LOW")).upper()
 
         if severity not in ALLOWED_SEVERITIES:
             severity = "LOW"
@@ -340,12 +354,8 @@ Changed code:
             "title": str(
                 finding.get("title", "Code quality improvement")
             ),
-            "explanation": str(
-                finding.get("explanation", "")
-            ),
-            "suggested_fix": str(
-                finding.get("suggested_fix", "")
-            ),
+            "explanation": str(finding.get("explanation", "")),
+            "suggested_fix": str(finding.get("suggested_fix", "")),
             "confidence": confidence
         })
 
@@ -379,9 +389,7 @@ def main():
 
         report = review_style(parsed_data, valid_lines)
 
-        output_file = (
-            ARTIFACTS / f"pr_{pr_number}_style_findings.json"
-        )
+        output_file = ARTIFACTS / f"pr_{pr_number}_style_findings.json"
 
         with open(output_file, "w", encoding="utf-8") as file:
             json.dump(report, file, indent=4)
@@ -392,8 +400,7 @@ def main():
         for finding in report["findings"]:
             print(
                 f"\n[{finding['severity']}] "
-                f"{finding['filename']}:"
-                f"{finding['line_number']}"
+                f"{finding['filename']}:{finding['line_number']}"
             )
             print(f"Issue: {finding['title']}")
             print(f"Confidence: {finding['confidence']}")
@@ -407,6 +414,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
