@@ -1,0 +1,82 @@
+
+name: AI Pull Request Review Bot
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ai-code-review:
+    name: Run AI Code Review
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Fetch Pull Request diff
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python src/github/fetch_diff.py \
+            "${{ github.repository_owner }}" \
+            "${{ github.event.repository.name }}" \
+            "${{ github.event.pull_request.number }}"
+
+      - name: Parse changed code
+        run: |
+          python src/review/diff_parser.py \
+            "${{ github.event.pull_request.number }}"
+
+      - name: Run Bug Finder
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL: openai/gpt-oss-120b
+        run: |
+          python src/agents/bug_finder.py \
+            "${{ github.event.pull_request.number }}"
+
+      - name: Run Security Checker
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL: openai/gpt-oss-120b
+        run: |
+          python src/agents/security_checker.py \
+            "${{ github.event.pull_request.number }}"
+
+      - name: Run Style Reviewer
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL: openai/gpt-oss-120b
+        run: |
+          python src/agents/style_reviewer.py \
+            "${{ github.event.pull_request.number }}"
+
+      - name: Combine review findings
+        run: |
+          python src/review/review_coordinator.py \
+            "${{ github.event.pull_request.number }}"
+
+      - name: Post review to GitHub
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python src/github/post_review.py \
+            "${{ github.repository_owner }}" \
+            "${{ github.event.repository.name }}" \
+            "${{ github.event.pull_request.number }}" \
+            --post
