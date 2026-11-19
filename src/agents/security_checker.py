@@ -13,6 +13,11 @@ ARTIFACTS = ROOT / "artifacts"
 load_dotenv(ROOT / ".env")
 
 
+ALLOWED_SEVERITIES = {
+    "CRITICAL", "HIGH", "MEDIUM", "LOW"
+}
+
+
 def load_parsed_data(pr_number):
     input_file = ARTIFACTS / f"pr_{pr_number}_parsed.json"
 
@@ -50,6 +55,36 @@ def get_added_lines(parsed_data):
     return valid_lines
 
 
+def get_standard_severity(finding):
+    """
+    Apply consistent severity to known security vulnerabilities.
+    """
+
+    issue_text = " ".join([
+        str(finding.get("issue_type", "")),
+        str(finding.get("title", "")),
+        str(finding.get("explanation", ""))
+    ]).lower()
+
+    high_risk_indicators = [
+        "sql injection",
+        "command injection",
+        "hardcoded password",
+        "hardcoded secret",
+        "hardcoded api key",
+        "hardcoded credentials",
+        "remote code execution"
+    ]
+
+    if any(
+        indicator in issue_text
+        for indicator in high_risk_indicators
+    ):
+        return "HIGH"
+
+    return None
+
+
 def review_security(parsed_data, valid_lines):
     api_key = os.getenv("GROQ_API_KEY")
     model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
@@ -74,8 +109,24 @@ Focus on:
 7. Command injection.
 8. Other serious application security weaknesses.
 
+SEVERITY POLICY:
+
+- SQL injection: HIGH.
+- Command injection: HIGH.
+- Hardcoded passwords, API keys and credentials: HIGH.
+- Remote code execution: HIGH.
+- Other vulnerabilities: Classify according to actual impact.
+
+Severity definitions:
+- CRITICAL: Extremely severe vulnerability with major
+  security impact.
+- HIGH: Serious vulnerability that could compromise
+  application security or sensitive data.
+- MEDIUM: Security weakness with limited or conditional impact.
+- LOW: Minor security weakness with low impact.
+
 Rules:
-- Report only genuine security issues supported by the code.
+- Report only genuine security issues supported by code.
 - Do not invent vulnerabilities.
 - Do not report ordinary programming bugs unless they
   create a security risk.
@@ -84,6 +135,7 @@ Rules:
 - Explain the security impact clearly.
 - Suggest a practical fix.
 - Avoid duplicate findings.
+- Follow the severity policy consistently.
 
 Return ONLY valid JSON in this format:
 
@@ -121,7 +173,8 @@ Changed code:
                 "role": "system",
                 "content": (
                     "You are a careful application security reviewer. "
-                    "Report only evidence-based vulnerabilities."
+                    "Follow the severity policy and report only "
+                    "evidence-based vulnerabilities."
                 )
             },
             {
@@ -142,10 +195,6 @@ Changed code:
 
     validated_findings = []
     seen = set()
-
-    allowed_severities = {
-        "CRITICAL", "HIGH", "MEDIUM", "LOW"
-    }
 
     for finding in findings:
         filename = finding.get("filename")
@@ -180,8 +229,13 @@ Changed code:
             finding.get("severity", "MEDIUM")
         ).upper()
 
-        if severity not in allowed_severities:
+        if severity not in ALLOWED_SEVERITIES:
             severity = "MEDIUM"
+
+        standard_severity = get_standard_severity(finding)
+
+        if standard_severity:
+            severity = standard_severity
 
         try:
             confidence = float(finding.get("confidence", 0.5))
@@ -264,4 +318,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

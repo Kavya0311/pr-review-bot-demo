@@ -15,6 +15,11 @@ ARTIFACTS = ROOT / "artifacts"
 load_dotenv(ROOT / ".env")
 
 
+ALLOWED_SEVERITIES = {
+    "CRITICAL", "HIGH", "MEDIUM", "LOW"
+}
+
+
 def load_parsed_data(pr_number):
     input_file = ARTIFACTS / f"pr_{pr_number}_parsed.json"
 
@@ -27,7 +32,6 @@ def load_parsed_data(pr_number):
     with open(input_file, "r", encoding="utf-8") as file:
         data = json.load(file)
 
-    # Support both list and dictionary formats.
     if isinstance(data, dict):
         data = data.get("files", [])
 
@@ -53,6 +57,58 @@ def get_added_lines(parsed_data):
     return valid_lines
 
 
+def get_standard_severity(finding, code):
+    """
+    Apply consistent severity rules for known issue categories.
+    Unknown issue categories retain the AI-provided severity.
+    """
+
+    issue_text = " ".join([
+        str(finding.get("issue_type", "")),
+        str(finding.get("title", "")),
+        str(finding.get("explanation", ""))
+    ]).lower()
+
+    # SQL injection is always HIGH.
+    sql_indicators = [
+        "injection",
+        "unsafe",
+        "concatenation",
+        "string construction",
+        "dynamic sql"
+    ]
+
+    if (
+        "sql" in issue_text
+        and any(word in issue_text for word in sql_indicators)
+    ):
+        return "HIGH"
+
+    # Division by zero is consistently MEDIUM.
+    division_words = [
+        "division",
+        "divide",
+        "dividing",
+        "denominator"
+    ]
+
+    zero_words = [
+        "zero",
+        "0",
+        "without zero check",
+        "zero check"
+    ]
+
+    if (
+        any(word in issue_text for word in division_words)
+        and any(word in issue_text for word in zero_words)
+    ):
+        return "MEDIUM"
+
+    # Keep the AI severity for other issue categories.
+    return None
+
+
 def review_code(parsed_data, valid_lines):
     api_key = os.getenv("GROQ_API_KEY")
     model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
@@ -66,26 +122,39 @@ def review_code(parsed_data, valid_lines):
 You are an experienced software engineer performing a
 bug-focused review of GitHub Pull Request changes.
 
-Analyze the following changed code carefully.
+Analyze the supplied changed code carefully.
 
 Your responsibilities:
-1. Identify actual programming bugs.
+1. Identify genuine programming bugs.
 2. Detect incorrect logic and runtime errors.
 3. Detect possible division-by-zero errors.
 4. Identify unsafe code that can cause application failures.
-5. Identify SQL injection when it appears in the changed code.
+5. Detect SQL injection where supported by code evidence.
 6. Avoid reporting correct code as a bug.
 7. Do not invent problems without evidence.
-8. Report only issues associated with the supplied added lines.
-9. Do not report formatting or naming suggestions unless they
-   create an actual bug.
+8. Report only issues associated with supplied added lines.
+9. Do not report formatting or naming suggestions as bugs.
 10. Avoid duplicate findings for the same issue.
+
+SEVERITY POLICY - FOLLOW EXACTLY:
+
+- SQL injection: HIGH.
+- Division by zero: MEDIUM.
+- Unnecessary temporary variables: Do not report as bugs.
+- Other issues: Choose severity based on actual impact.
+
+Severity definitions:
+- CRITICAL: Severe impact, such as a major security compromise.
+- HIGH: Serious security vulnerability or major application failure.
+- MEDIUM: Runtime errors or functional problems in specific conditions.
+- LOW: Minor issues with limited impact.
 
 IMPORTANT:
 - Use the exact filename and line number supplied.
 - Only report line numbers present in the added code.
 - Give a clear explanation of the problem.
 - Suggest a practical correction.
+- Do not increase severity just to make an issue appear important.
 
 Return ONLY valid JSON in this format:
 
@@ -123,6 +192,7 @@ Changed code:
                 "role": "system",
                 "content": (
                     "You are a precise bug detection agent. "
+                    "Follow the supplied severity policy exactly. "
                     "Report only genuine, evidence-based issues."
                 )
             },
@@ -142,13 +212,8 @@ Changed code:
     if not isinstance(findings, list):
         raise ValueError("The AI returned an invalid findings format.")
 
-    # Validate every finding against actual added lines.
     validated_findings = []
     seen = set()
-
-    allowed_severities = {
-        "CRITICAL", "HIGH", "MEDIUM", "LOW"
-    }
 
     for finding in findings:
         filename = finding.get("filename")
@@ -183,8 +248,17 @@ Changed code:
             finding.get("severity", "MEDIUM")
         ).upper()
 
-        if severity not in allowed_severities:
+        if severity not in ALLOWED_SEVERITIES:
             severity = "MEDIUM"
+
+        # Apply deterministic severity rules.
+        standard_severity = get_standard_severity(
+            finding,
+            valid_lines[(filename, line_number)]
+        )
+
+        if standard_severity:
+            severity = standard_severity
 
         try:
             confidence = float(finding.get("confidence", 0.5))
@@ -208,7 +282,7 @@ Changed code:
         })
 
     return {
-        "model": os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
+        "model": model,
         "overall_summary": str(
             result.get("overall_summary", "Bug review completed.")
         ),
@@ -265,4 +339,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

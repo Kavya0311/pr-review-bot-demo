@@ -12,6 +12,10 @@ ARTIFACTS = ROOT / "artifacts"
 
 load_dotenv(ROOT / ".env")
 
+ALLOWED_SEVERITIES = {
+    "CRITICAL", "HIGH", "MEDIUM", "LOW"
+}
+
 
 def load_parsed_data(pr_number):
     input_file = ARTIFACTS / f"pr_{pr_number}_parsed.json"
@@ -50,6 +54,109 @@ def get_added_lines(parsed_data):
     return valid_lines
 
 
+def is_bug_or_security_finding(finding):
+    issue_text = " ".join([
+        str(finding.get("issue_type", "")),
+        str(finding.get("title", "")),
+        str(finding.get("explanation", ""))
+    ]).lower()
+
+    # Exclude SQL injection findings.
+    if "sql" in issue_text and any(
+        word in issue_text
+        for word in [
+            "injection",
+            "concatenation",
+            "unsafe query",
+            "dynamic sql"
+        ]
+    ):
+        return True
+
+    # Exclude division-by-zero findings.
+    division_words = [
+        "division",
+        "divide",
+        "dividing",
+        "denominator"
+    ]
+
+    zero_words = [
+        "zero",
+        "0",
+        "without zero check"
+    ]
+
+    if (
+        any(word in issue_text for word in division_words)
+        and any(word in issue_text for word in zero_words)
+    ):
+        return True
+
+    # Runtime error-handling issues belong to Bug Finder.
+    if "missing error handling" in issue_text:
+        return True
+
+    return False
+
+
+def is_false_temporary_variable_finding(finding, code):
+    issue_text = " ".join([
+        str(finding.get("issue_type", "")),
+        str(finding.get("title", "")),
+        str(finding.get("explanation", ""))
+    ]).lower()
+
+    is_temporary_variable = (
+        "temporary variable" in issue_text
+        or "unnecessary variable" in issue_text
+    )
+
+    code_lower = code.lower()
+
+    sql_keywords = [
+        "select ",
+        "insert ",
+        "update ",
+        "delete "
+    ]
+
+    is_dynamic_sql = (
+        any(keyword in code_lower for keyword in sql_keywords)
+        and (
+            "+" in code
+            or ".format(" in code_lower
+            or "f\"" in code_lower
+            or "f'" in code_lower
+        )
+    )
+
+    return is_temporary_variable and is_dynamic_sql
+
+
+def get_standard_severity(finding):
+    issue_text = " ".join([
+        str(finding.get("issue_type", "")),
+        str(finding.get("title", "")),
+        str(finding.get("explanation", ""))
+    ]).lower()
+
+    temporary_variable_indicators = [
+        "unnecessary temporary variable",
+        "unnecessary variable",
+        "temporary variable",
+        "unused intermediate variable"
+    ]
+
+    if any(
+        indicator in issue_text
+        for indicator in temporary_variable_indicators
+    ):
+        return "LOW"
+
+    return None
+
+
 def review_style(parsed_data, valid_lines):
     api_key = os.getenv("GROQ_API_KEY")
     model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
@@ -63,27 +170,38 @@ def review_style(parsed_data, valid_lines):
 You are an experienced software engineer performing a
 code quality and maintainability review of a GitHub Pull Request.
 
-Analyze the changed code for meaningful style and quality problems.
+Analyze changed code for meaningful style and quality problems.
 
 Focus on:
 1. Unnecessary temporary variables.
 2. Poor variable and function naming.
-3. Missing error handling where it is important.
-4. Repeated or redundant code.
-5. Poor readability and maintainability.
-6. Unnecessary complexity.
-7. Violations of common coding conventions.
+3. Repeated or redundant code.
+4. Poor readability and maintainability.
+5. Unnecessary complexity.
+6. Important coding convention violations.
+
+DO NOT REPORT:
+- SQL injection or other security vulnerabilities.
+- Division by zero or other runtime bugs.
+- Generic missing error handling.
+- Minor formatting issues.
+- Personal style preferences.
+- Issues better handled by the Bug Finder or Security Checker.
+- A variable as unnecessary merely because it appears once.
+  First check whether it improves readability or serves a purpose.
+
+SEVERITY POLICY:
+- Unnecessary temporary variable: LOW.
+- Minor maintainability problem: LOW.
+- Meaningful readability or complexity problem: MEDIUM.
+- Do not assign HIGH or CRITICAL to ordinary style issues.
 
 Rules:
-- Focus on meaningful improvements, not personal preferences.
-- Do not report minor formatting issues.
-- Do not report the same issue as a security or bug finding
-  unless it is genuinely a separate code-quality problem.
-- Do not report division by zero or other runtime bugs.
+- Focus on meaningful improvements.
 - Do not invent missing requirements.
 - Report only issues on added lines.
 - Use exact filenames and line numbers.
-- Explain why the code quality should be improved.
+- Explain why code quality should be improved.
 - Suggest a practical correction.
 - Avoid duplicate findings.
 
@@ -123,7 +241,9 @@ Changed code:
                 "role": "system",
                 "content": (
                     "You are a practical code quality reviewer. "
-                    "Focus on useful, evidence-based improvements."
+                    "Report only meaningful, evidence-based "
+                    "maintainability improvements. "
+                    "Do not duplicate security or runtime bug findings."
                 )
             },
             {
@@ -145,10 +265,6 @@ Changed code:
     validated_findings = []
     seen = set()
 
-    allowed_severities = {
-        "CRITICAL", "HIGH", "MEDIUM", "LOW"
-    }
-
     for finding in findings:
         filename = finding.get("filename")
         line_number = finding.get("line_number")
@@ -159,6 +275,26 @@ Changed code:
         if (filename, line_number) not in valid_lines:
             print(
                 f"Skipped invalid line reference: "
+                f"{filename}:{line_number}"
+            )
+            continue
+
+        # Exclude security and runtime bug findings.
+        if is_bug_or_security_finding(finding):
+            print(
+                f"Skipped non-style finding: "
+                f"{filename}:{line_number}"
+            )
+            continue
+
+        source_code = valid_lines[(filename, line_number)]
+
+        # Exclude false temporary-variable findings on dynamic SQL lines.
+        if is_false_temporary_variable_finding(
+            finding, source_code
+        ):
+            print(
+                f"Skipped false temporary-variable finding: "
                 f"{filename}:{line_number}"
             )
             continue
@@ -182,8 +318,13 @@ Changed code:
             finding.get("severity", "LOW")
         ).upper()
 
-        if severity not in allowed_severities:
+        if severity not in ALLOWED_SEVERITIES:
             severity = "LOW"
+
+        standard_severity = get_standard_severity(finding)
+
+        if standard_severity:
+            severity = standard_severity
 
         try:
             confidence = float(finding.get("confidence", 0.5))
@@ -266,4 +407,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
